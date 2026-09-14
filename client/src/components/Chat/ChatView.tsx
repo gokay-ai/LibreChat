@@ -11,6 +11,7 @@ import {
   useScrollbarGutterSeed,
   useAddedResponse,
   useResumeOnLoad,
+  useBranchOnLoad,
   useAdaptiveSSE,
   useChatHelpers,
   useQueueDrain,
@@ -104,6 +105,7 @@ function ChatView({ index = 0, project }: { index?: number; project?: TChatProje
   // settle: a stale invalidated cache mounts with isLoading false while the
   // refetch is in flight, and resume must not build from (or race) it.
   useResumeOnLoad(conversationId, chatHelpers.getMessages, index, !isLoading && !isFetching);
+  useBranchOnLoad(conversationId, chatHelpers.getMessages, index, !isLoading && !isFetching);
 
   // Auto-send queued follow-up messages once a run finishes cleanly.
   useQueueDrain(index, conversationId, chatHelpers.ask);
