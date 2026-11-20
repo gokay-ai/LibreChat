@@ -13,7 +13,16 @@ import type {
 import type { SearchResponse, SearchParams, Index, MeiliSearchErrorInfo } from 'meilisearch';
 import type { IConversation, IMessage } from '~/types';
 import { buildRetentionVisibilityFilter, legacyPermanentExpirationFilter } from '~/utils/retention';
+import { runAfterTransaction } from '~/utils/postCommit';
 import logger from '~/config/meiliLogger';
+
+/** Internal per-query bypass for writes to non-searchable bookkeeping fields. A WeakSet keeps
+ * this marker out of driver options and stored data. Other model middleware still runs. */
+const queriesWithoutMeiliIndexing = new WeakSet<object>();
+export function withoutMeiliIndexing<T extends object>(query: T): T {
+  queriesWithoutMeiliIndexing.add(query);
+  return query;
+}
 
 interface MongoMeiliOptions {
   host: string;
@@ -759,7 +768,7 @@ const createMeiliMongooseModel = ({
 
         const projection = Object.keys(this.schema.obj).reduce<Record<string, number>>(
           (results, key) => {
-            if (!key.startsWith('$')) {
+            if (!key.startsWith('$') && this.schema.path(key)?.options?.select !== false) {
               results[key] = 1;
             }
             return results;
@@ -1146,6 +1155,10 @@ export default function mongoMeili(schema: Schema, options: MongoMeiliOptions): 
   });
 
   schema.pre('findOneAndUpdate', function (next) {
+    if (queriesWithoutMeiliIndexing.has(this)) {
+      next();
+      return;
+    }
     const query = this as Query<unknown, unknown>;
     if (meiliEnabled) {
       const version = new mongoose.Types.ObjectId().toString();
@@ -1285,23 +1298,28 @@ export default function mongoMeili(schema: Schema, options: MongoMeiliOptions): 
       const savedDoc = doc;
       const model = (this as Query<unknown, DocumentWithMeiliIndex>).model;
       next();
-      runDetachedMeiliOperation(
-        getOperationKey(savedDoc),
+      void runAfterTransaction(
+        (this as Query<unknown, DocumentWithMeiliIndex>).getOptions().session ?? undefined,
         async () => {
-          const latestDoc = await model
-            .findById(savedDoc._id)
-            .select(
-              [
-                '+_meiliIndex',
-                '+_meiliIndexAttempted',
-                '+_meiliIndexVersion',
-                ...(privateExcludedPath == null ? [] : [`+${privateExcludedPath}`]),
-              ].join(' '),
-            )
-            .exec();
-          await latestDoc?.addObjectToMeili?.(completeDetachedOperation);
+          runDetachedMeiliOperation(
+            getOperationKey(savedDoc),
+            async () => {
+              const latestDoc = await model
+                .findById(savedDoc._id)
+                .select(
+                  [
+                    '+_meiliIndex',
+                    '+_meiliIndexAttempted',
+                    '+_meiliIndexVersion',
+                    ...(privateExcludedPath == null ? [] : [`+${privateExcludedPath}`]),
+                  ].join(' '),
+                )
+                .exec();
+              await latestDoc?.addObjectToMeili?.(completeDetachedOperation);
+            },
+            '[mongoMeili] Detached findOneAndUpdate indexing failed:',
+          );
         },
-        '[mongoMeili] Detached findOneAndUpdate indexing failed:',
       );
     },
   );

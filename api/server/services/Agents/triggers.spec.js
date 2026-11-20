@@ -19,6 +19,7 @@ const mockQueuedTurnLifecycle = {
 
 jest.mock('@librechat/api', () => ({
   createCheckpointDeletionReclaimer: jest.fn((getJobs) => () => getJobs('owner', 'tenant')),
+  createBackgroundToolDeadClaimRecovery: jest.fn(() => jest.fn()),
   createAgentTriggerService: (...args) => mockCreateAgentTriggerService(...args),
   createAgentContinuationResolver: jest.fn(() => jest.fn()),
   createAgentEventContinueResolver: jest.fn(() => jest.fn()),
@@ -35,6 +36,10 @@ jest.mock('@librechat/api', () => ({
 jest.mock('~/models', () => ({
   isAgentTriggerPrincipalActive: jest.fn(),
 }));
+jest.mock('../Responses', () => ({ backgroundResponseSourceDispatchers: new Map() }));
+jest.mock('../ChannelAuthority', () => {
+  throw new Error('Generic triggers must not import channel authority');
+});
 
 describe('agent trigger service composition', () => {
   beforeEach(() => {
@@ -43,6 +48,7 @@ describe('agent trigger service composition', () => {
     mockGenerationJobManager.supportsDetachedAgentEventActions = true;
     let completionResultBatchSize = 8;
     mockCreateAgentTriggerService.mockReturnValue({
+      isReady: jest.fn(() => false),
       initialize: jest.fn(async (options) => {
         completionResultBatchSize = options.completionResultBatchSize ?? 8;
       }),
@@ -70,6 +76,18 @@ describe('agent trigger service composition', () => {
     );
   });
 
+  it('installs Responses dispatch without obsolete channel chat-source authorization', () => {
+    const composition = require('./triggers');
+    expect(composition.isAgentTriggerServiceReady).toBe(
+      mockCreateAgentTriggerService.mock.results[0].value.isReady,
+    );
+    const dependencies = mockCreateAgentTriggerService.mock.calls[0][0];
+    expect(dependencies.sourceDispatchers).toBe(
+      require('../Responses').backgroundResponseSourceDispatchers,
+    );
+    expect(dependencies.authorizeSource).toBeUndefined();
+  });
+
   it('advertises detached completion capability for every compatible generation store', () => {
     require('./triggers');
     const supportsDetachedActionCompletion =
@@ -78,6 +96,23 @@ describe('agent trigger service composition', () => {
     expect(supportsDetachedActionCompletion()).toBe(true);
     mockGenerationJobManager.supportsDetachedAgentEventActions = false;
     expect(supportsDetachedActionCompletion()).toBe(false);
+  });
+
+  it('passes the recovery policy to both delivery and queued-turn workers', async () => {
+    const { initializeAgentTriggerService } = require('./triggers');
+    const options = {
+      address: 'local',
+      idlePolling: {
+        queuedTurnMaxIntervalMs: 60_000,
+        maintenanceMaxIntervalMs: 90_000,
+        deliveryMaxIntervalMs: 5_000,
+      },
+    };
+    await initializeAgentTriggerService(options);
+    expect(mockCreateAgentTriggerService.mock.results[0].value.initialize).toHaveBeenCalledWith(
+      options,
+    );
+    expect(mockQueuedTurnLifecycle.initialize).toHaveBeenCalledWith({ maxIdleIntervalMs: 60_000 });
   });
 
   it('injects the configured background completion batch size', async () => {
