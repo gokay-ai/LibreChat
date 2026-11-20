@@ -1,3 +1,5 @@
+import { inspect } from 'util';
+import { logger } from '@librechat/data-schemas';
 import { TokenExchangeMethodEnum } from 'librechat-data-provider';
 import type { AuthorizationServerMetadata } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { MCPOptions } from 'librechat-data-provider';
@@ -100,6 +102,156 @@ describe('MCPOAuthHandler - Configurable OAuth Metadata', () => {
         userId: 'user-123',
         serverName: 'test-server',
       });
+    });
+  });
+
+  describe('credential-safe diagnostics', () => {
+    const secret = 'sentinel-client-secret';
+    const verifier = 'sentinel-pkce-verifier';
+    const header = 'sentinel-oauth-header';
+    const config: MCPOptions['oauth'] = {
+      authorization_url: 'https://auth.example.com/oauth/authorize',
+      token_url: 'https://auth.example.com/oauth/token',
+      client_id: 'test-client',
+      client_secret: secret,
+    };
+
+    beforeEach(() => {
+      mockDiscoverOAuthProtectedResourceMetadata.mockResolvedValue({
+        resource: mockServerUrl,
+        authorization_servers: ['https://auth.example.com'],
+      });
+      mockDiscoverAuthorizationServerMetadata.mockResolvedValue({
+        issuer: 'https://auth.example.com',
+        authorization_endpoint: config.authorization_url,
+        token_endpoint: config.token_url,
+        registration_endpoint: 'https://auth.example.com/register',
+        response_types_supported: ['code'],
+      } as AuthorizationServerMetadata);
+      mockRegisterClient.mockResolvedValue({
+        client_id: 'test-client',
+        client_secret: secret,
+        redirect_uris: [],
+        logo_uri: undefined,
+        tos_uri: undefined,
+      });
+      mockStartAuthorization.mockResolvedValue({
+        authorizationUrl: new URL('https://auth.example.com/oauth/authorize'),
+        codeVerifier: verifier,
+      });
+    });
+
+    afterEach(() => {
+      mockDiscoverOAuthProtectedResourceMetadata.mockReset();
+      mockDiscoverAuthorizationServerMetadata.mockReset();
+      mockRegisterClient.mockReset();
+    });
+
+    function loggedDiagnostics() {
+      return inspect(
+        [logger.debug, logger.info, logger.warn, logger.error].map(
+          (log) => jest.mocked(log).mock.calls,
+        ),
+        { depth: null },
+      );
+    }
+
+    it.each([true, false])(
+      'keeps credentials in the flow but not logs, configured: %s',
+      async (configured) => {
+        const result = await MCPOAuthHandler.initiateOAuthFlow(
+          mockServerName,
+          mockServerUrl,
+          mockUserId,
+          { Authorization: header },
+          configured ? config : undefined,
+        );
+
+        expect(result.flowMetadata.clientInfo?.client_secret).toBe(secret);
+        expect(result.flowMetadata.codeVerifier).toBe(verifier);
+        expect(result.flowMetadata.oauthHeaders).toEqual({ Authorization: header });
+        expect(new URL(result.authorizationUrl).searchParams.get('state')).toBe(
+          result.flowMetadata.state,
+        );
+        for (const value of [secret, verifier, header, result.flowMetadata.state]) {
+          expect(loggedDiagnostics()).not.toContain(value);
+        }
+      },
+    );
+
+    it.each([true, false])('omits raw initiation failures, configured: %s', async (configured) => {
+      const error = Object.assign(new Error(secret), {
+        response: { status: 400, data: { client_secret: secret } },
+      });
+      mockStartAuthorization.mockRejectedValueOnce(error);
+
+      await expect(
+        MCPOAuthHandler.initiateOAuthFlow(
+          mockServerName,
+          mockServerUrl,
+          mockUserId,
+          {},
+          configured ? config : undefined,
+        ),
+      ).rejects.toBe(error);
+      expect(logger.error).toHaveBeenCalledWith('[MCPOAuth] Failed to initiate OAuth flow', {
+        error: { type: 'Error', status: 400 },
+        serverName: mockServerName,
+        userId: mockUserId,
+      });
+      expect(loggedDiagnostics()).not.toContain(secret);
+    });
+
+    it('sanitizes token-exchange errors before persisting or propagating the failure', async () => {
+      const error = Object.assign(new Error(secret), {
+        config: { data: secret, headers: { Authorization: header } },
+        response: { status: 401, data: { refresh_token: secret } },
+      });
+      const failFlowIfCurrent = jest.fn().mockResolvedValue('updated');
+      const flowManager = {
+        getFlowState: jest.fn().mockResolvedValue({
+          createdAt: 123,
+          metadata: {
+            serverName: mockServerName,
+            serverUrl: mockServerUrl,
+            state: 'flow-state',
+            codeVerifier: verifier,
+            clientInfo: { client_id: 'test-client', client_secret: secret },
+            metadata: {},
+          },
+        }),
+        failFlowIfCurrent,
+      } as unknown as FlowStateManager<MCPOAuthTokens>;
+      mockExchangeAuthorization.mockRejectedValueOnce(error);
+
+      const failure = await MCPOAuthHandler.completeOAuthFlow(
+        'test-flow',
+        'auth-code',
+        flowManager,
+        {},
+      ).catch((error: unknown) => error);
+      expect(failure).toEqual(
+        expect.objectContaining({
+          message: 'OAuth token exchange failed',
+          status: 401,
+        }),
+      );
+      expect(failure).not.toBe(error);
+      expect(inspect(failure, { depth: null })).not.toContain(secret);
+      expect(inspect(failure, { depth: null })).not.toContain(header);
+      expect(failFlowIfCurrent).toHaveBeenCalledWith(
+        'test-flow',
+        'mcp_oauth',
+        123,
+        'flow-state',
+        failure,
+      );
+      expect(logger.error).toHaveBeenCalledWith('[MCPOAuth] Failed to complete OAuth flow', {
+        error: { type: 'Error', status: 401 },
+        flowId: 'test-flow',
+      });
+      expect(loggedDiagnostics()).not.toContain(secret);
+      expect(loggedDiagnostics()).not.toContain(header);
     });
   });
 
@@ -1129,6 +1281,10 @@ describe('MCPOAuthHandler - Configurable OAuth Metadata', () => {
       ).rejects.toThrow(
         'Token refresh failed: 400 Bad Request - {"error":"invalid_request","error_description":"refresh_token.client_id: Field required"}',
       );
+      expect(logger.error).toHaveBeenCalledWith(
+        '[MCPOAuth] Failed to refresh tokens for test-server',
+        { type: 'Error' },
+      );
     });
 
     describe('stored token endpoint binding', () => {
@@ -1696,6 +1852,38 @@ describe('MCPOAuthHandler - Configurable OAuth Metadata', () => {
       expect(headers.get('foo')).toBe('bar');
     });
 
+    it('snapshots the headers in the flow, an empty map included, on both initiation paths', async () => {
+      mockRegisterClient.mockResolvedValue({
+        client_id: 'test',
+        redirect_uris: [],
+        logo_uri: undefined,
+        tos_uri: undefined,
+      });
+      const preconfigured = {
+        authorization_url: 'http://example.com/auth',
+        token_url: 'http://example.com/token',
+        client_id: 'configured-client',
+      };
+
+      const initiate = (headers: Record<string, string>, config: MCPOptions['oauth']) =>
+        MCPOAuthHandler.initiateOAuthFlow(
+          'test-server',
+          'http://example.com',
+          'user-123',
+          headers,
+          config,
+        );
+      const [discoveredEmpty, configuredEmpty, discoveredSet] = await Promise.all([
+        initiate({}, {}),
+        initiate({}, preconfigured),
+        initiate({ foo: 'bar' }, {}),
+      ]);
+
+      expect(discoveredEmpty.flowMetadata.oauthHeaders).toEqual({});
+      expect(configuredEmpty.flowMetadata.oauthHeaders).toEqual({});
+      expect(discoveredSet.flowMetadata.oauthHeaders).toEqual({ foo: 'bar' });
+    });
+
     it('passes headers to auto-discovery operations', async () => {
       mockDiscoverOAuthProtectedResourceMetadata.mockImplementation(async (_, __, fetchFn) => {
         await fetchFn?.('http://example.com/.well-known/oauth-protected-resource', {});
@@ -1756,6 +1944,41 @@ describe('MCPOAuthHandler - Configurable OAuth Metadata', () => {
         expect.any(Number),
         '',
         expect.objectContaining({ credential_set_id: result.credential_set_id }),
+      );
+    });
+
+    it('normalizes a zero exchange lifetime before persistence', async () => {
+      const flowManager = {
+        getFlowState: jest.fn().mockResolvedValue({
+          status: 'PENDING',
+          createdAt: 123,
+          metadata: {
+            serverName: 'test-server',
+            codeVerifier: 'verifier',
+            clientInfo: {},
+            metadata: {},
+          },
+        }),
+        completeFlowIfCurrent: jest.fn().mockResolvedValue('updated'),
+      } as unknown as FlowStateManager<MCPOAuthTokens>;
+      mockExchangeAuthorization.mockResolvedValue({
+        access_token: 'expired-token',
+        token_type: 'Bearer',
+        expires_in: 0,
+      });
+      const persist = jest.fn(async (tokens: MCPOAuthTokens) => tokens);
+      const result = await MCPOAuthHandler.completeOAuthFlow(
+        'flow',
+        'code',
+        flowManager,
+        {},
+        persist,
+      );
+      expect(result.expires_at).toEqual(expect.any(Number));
+      expect(result.expires_at).toBeLessThanOrEqual(Date.now());
+      expect(persist).toHaveBeenCalledWith(
+        expect.objectContaining({ expires_in: 0, expires_at: result.expires_at }),
+        expect.any(Function),
       );
     });
 
@@ -3318,7 +3541,7 @@ describe('MCPOAuthHandler - Configurable OAuth Metadata', () => {
       );
 
       expect(mockExchangeAuthorization).toHaveBeenCalledTimes(1);
-      expect(mockExchangeAuthorization.mock.calls[0][1].resource?.href).toBe(
+      expect(String(mockExchangeAuthorization.mock.calls[0][1].resource)).toBe(
         'https://example.com/mcp',
       );
     });

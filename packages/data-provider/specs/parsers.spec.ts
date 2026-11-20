@@ -1,6 +1,8 @@
 import {
   parseConvo,
+  getSpeechText,
   parseTextParts,
+  parseThinkingContent,
   parseCompactConvo,
   replaceSpecialVars,
   getEphemeralSender,
@@ -10,7 +12,7 @@ import {
   parseEphemeralAgentId,
 } from '../src/parsers';
 import { specialVariables } from '../src/config';
-import { EModelEndpoint, Providers } from '../src/schemas';
+import { EModelEndpoint, Providers, ThinkingDisplay, AnthropicEffort } from '../src/schemas';
 import { ContentTypes } from '../src/types/runs';
 import type { TMessageContentParts } from '../src/types/content';
 import type { TUser, TConversation } from '../src/types';
@@ -304,6 +306,60 @@ describe('parseCompactConvo', () => {
       expect(result?.model).toBe('gpt-4');
     });
   });
+
+  describe('agents generation params', () => {
+    const generationParams = {
+      agent_id: 'agent_123',
+      spec: 'claude-sonnet-5',
+      model: 'claude-sonnet-5',
+      maxContextTokens: 1000000,
+      temperature: 0.3,
+      topP: 0.9,
+      top_p: 0.85,
+      thinking: true,
+      thinkingDisplay: ThinkingDisplay.summarized,
+      effort: AnthropicEffort.high,
+      maxOutputTokens: 8192,
+      max_tokens: 4096,
+    } satisfies Partial<TConversation>;
+
+    test('preserves UI generation params and omits model', () => {
+      const result = parseCompactConvo({
+        endpoint: EModelEndpoint.agents,
+        conversation: generationParams,
+      });
+
+      expect(result).not.toBeNull();
+      expect(result?.agent_id).toBe('agent_123');
+      expect(result?.spec).toBe('claude-sonnet-5');
+      expect(result?.maxContextTokens).toBe(1000000);
+      expect(result?.temperature).toBe(0.3);
+      expect(result?.topP).toBe(0.9);
+      expect(result?.top_p).toBe(0.85);
+      expect(result?.thinking).toBe(true);
+      expect(result?.thinkingDisplay).toBe(ThinkingDisplay.summarized);
+      expect(result?.effort).toBe(AnthropicEffort.high);
+      expect(result?.maxOutputTokens).toBe(8192);
+      expect(result?.max_tokens).toBe(4096);
+      expect(result?.model).toBeUndefined();
+    });
+
+    test('drops unknown request fields the way other compact schemas do', () => {
+      const result = parseCompactConvo({
+        endpoint: EModelEndpoint.agents,
+        conversation: {
+          ...generationParams,
+          conversationId: 'convo-1',
+          title: 'New Chat',
+        },
+      });
+
+      expect(result).not.toBeNull();
+      expect(result?.maxContextTokens).toBe(1000000);
+      expect(result?.conversationId).toBeUndefined();
+      expect(result?.title).toBeUndefined();
+    });
+  });
 });
 
 describe('parseConvo - defaultParamsEndpoint', () => {
@@ -593,6 +649,74 @@ describe('parseCompactConvo - defaultParamsEndpoint', () => {
     expect(result).not.toBeNull();
     expect(result?.max_tokens).toBe(4096);
     expect(result?.maxOutputTokens).toBeUndefined();
+  });
+});
+
+describe('getSpeechText', () => {
+  test('speaks text parts and skips think parts', () => {
+    const content: TMessageContentParts[] = [
+      { type: ContentTypes.THINK, think: 'internal reasoning' },
+      { type: ContentTypes.TEXT, text: 'First.' },
+      { type: ContentTypes.THINK, think: 'more reasoning' },
+      { type: ContentTypes.TEXT, text: 'Second.' },
+    ];
+    expect(getSpeechText({ content, text: 'ignored' })).toBe('First. Second.');
+  });
+
+  test('is empty for a response that only reasoned', () => {
+    const content: TMessageContentParts[] = [{ type: ContentTypes.THINK, think: 'reasoning' }];
+    expect(getSpeechText({ content })).toBe('');
+  });
+
+  test('never speaks steer parts', () => {
+    const content: TMessageContentParts[] = [
+      { type: ContentTypes.STEER, steer: 'user words' } as TMessageContentParts,
+      { type: ContentTypes.TEXT, text: 'answer' },
+    ];
+    expect(getSpeechText({ content })).toBe('answer');
+  });
+
+  test('falls back to plain text when there are no content parts', () => {
+    expect(getSpeechText({ content: [], text: 'plain answer' })).toBe('plain answer');
+    expect(getSpeechText({ text: 'plain answer' })).toBe('plain answer');
+    expect(getSpeechText({ content: null, text: null })).toBe('');
+  });
+
+  test('speaks string content, as imported messages may carry it', () => {
+    const content = ':::thinking\nWork it out.\n:::\nThe answer is 4.';
+    expect(getSpeechText({ content, text: '' })).toBe('The answer is 4.');
+  });
+
+  test('falls back to text when string content is empty', () => {
+    expect(getSpeechText({ content: '', text: 'stored answer' })).toBe('stored answer');
+  });
+
+  test('strips a legacy thinking block from plain text', () => {
+    const text = ':::thinking\nWork it out.\n:::\nThe answer is 4.';
+    expect(getSpeechText({ text })).toBe('The answer is 4.');
+  });
+
+  test('speaks a repeated thinking block, which the message view shows as answer text', () => {
+    const text = ':::thinking\na\n:::\nAnswer 1\n:::thinking\nb\n:::\nAnswer 2';
+    expect(getSpeechText({ text })).toBe(parseThinkingContent(text).regularContent);
+    expect(getSpeechText({ text })).toBe('Answer 1\n:::thinking\nb\n:::\nAnswer 2');
+  });
+
+  test('trims structured answers so whitespace alone is not speakable', () => {
+    const content: TMessageContentParts[] = [
+      { type: ContentTypes.THINK, think: 'reasoning' },
+      { type: ContentTypes.TEXT, text: '\n' },
+    ];
+    expect(getSpeechText({ content })).toBe('');
+  });
+
+  test('speaks an unmatched marker, which the UI shows as answer text', () => {
+    const text = 'Wrap reasoning in a :::thinking block.';
+    expect(getSpeechText({ text })).toBe(text);
+  });
+
+  test('keeps plain text that merely uses colons', () => {
+    expect(getSpeechText({ text: 'Ratio is 3:1 ::: done' })).toBe('Ratio is 3:1 ::: done');
   });
 });
 

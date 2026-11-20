@@ -150,6 +150,58 @@ describe('buildEndpointOption - defaultParamsEndpoint parsing', () => {
     expect(parsedResult.temperature).toBe(0.7);
   });
 
+  describe('request-scoped reasoning override wiring', () => {
+    it('passes an accepted override through to model_parameters', async () => {
+      mockGetEndpointsConfig.mockResolvedValue({});
+      mockAgentBuildOptions.mockReturnValueOnce({
+        endpoint: EModelEndpoint.openAI,
+        model_parameters: { model: 'gpt-5.1', reasoning_effort: 'low' },
+        agent: Promise.resolve({ provider: EModelEndpoint.openAI, model: 'gpt-5.1' }),
+      });
+      const req = createReq(
+        {
+          endpoint: EModelEndpoint.openAI,
+          model: 'gpt-5.1',
+          reasoningOverride: { key: 'reasoning_effort', value: 'high' },
+        },
+        { modelSpecs: null },
+      );
+      req.baseUrl = '/api/agents/chat';
+      const next = jest.fn();
+
+      await buildEndpointOption(req, createRes(), next);
+
+      expect(req.body.endpointOption.model_parameters.reasoning_effort).toBe('high');
+      expect(next).toHaveBeenCalled();
+    });
+
+    it('turns a rejected override into an error response without calling next', async () => {
+      mockGetEndpointsConfig.mockResolvedValue({});
+      mockAgentBuildOptions.mockReturnValueOnce({
+        endpoint: EModelEndpoint.openAI,
+        model_parameters: { model: 'gpt-5.1', reasoning_effort: 'low' },
+        agent: Promise.resolve({ provider: EModelEndpoint.openAI, model: 'gpt-5.1' }),
+      });
+      const req = createReq(
+        {
+          endpoint: EModelEndpoint.openAI,
+          model: 'gpt-5.1',
+          reasoningOverride: { key: 'effort', value: 'high' },
+        },
+        { modelSpecs: null },
+      );
+      req.baseUrl = '/api/agents/chat';
+      const res = createRes();
+      const next = jest.fn();
+      const { handleError } = require('@librechat/api');
+
+      await buildEndpointOption(req, res, next);
+
+      expect(handleError).toHaveBeenCalledWith(res, { text: 'Invalid reasoning override' });
+      expect(next).not.toHaveBeenCalled();
+    });
+  });
+
   it('should strip bedrock region from custom endpoint without defaultParamsEndpoint', async () => {
     mockGetEndpointsConfig.mockResolvedValue({
       MyEndpoint: {
@@ -727,4 +779,387 @@ describe('buildEndpointOption - defaultParamsEndpoint parsing', () => {
       expect.objectContaining({ text: 'Invalid model spec' }),
     );
   });
+});
+
+describe('buildEndpointOption - agents generation params', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('keeps UI generation params on the agents endpoint and omits model', async () => {
+    mockGetEndpointsConfig.mockResolvedValue({});
+
+    const req = createReq(
+      {
+        endpoint: EModelEndpoint.agents,
+        agent_id: 'agent_123',
+        spec: 'claude-sonnet-5',
+        model: 'claude-sonnet-5',
+        maxContextTokens: 1000000,
+        temperature: 0.3,
+        topP: 0.9,
+        thinking: true,
+        thinkingDisplay: 'summarized',
+        effort: 'high',
+      },
+      { modelSpecs: null },
+    );
+    req.baseUrl = '/api/agents/chat';
+
+    await buildEndpointOption(req, createRes(), jest.fn());
+
+    const parsedResult = parseCompactConvo.mock.results[0].value;
+    expect(parsedResult.maxContextTokens).toBe(1000000);
+    expect(parsedResult.temperature).toBe(0.3);
+    expect(parsedResult.topP).toBe(0.9);
+    expect(parsedResult.thinking).toBe(true);
+    expect(parsedResult.thinkingDisplay).toBe('summarized');
+    expect(parsedResult.effort).toBe('high');
+    expect(parsedResult.model).toBeUndefined();
+
+    expect(mockAgentBuildOptions).toHaveBeenCalledWith(
+      req,
+      EModelEndpoint.agents,
+      expect.objectContaining({
+        agent_id: 'agent_123',
+        maxContextTokens: 1000000,
+        temperature: 0.3,
+        topP: 0.9,
+        thinking: true,
+      }),
+      undefined,
+    );
+    expect(mockAgentBuildOptions.mock.calls[0][2].model).toBeUndefined();
+  });
+
+  it('keeps enforced modelSpec preset generation params on the agents endpoint', async () => {
+    mockGetEndpointsConfig.mockResolvedValue({});
+
+    const modelSpec = {
+      name: 'claude-sonnet-5',
+      preset: {
+        endpoint: EModelEndpoint.agents,
+        agent_id: 'agent_abc',
+        model: 'claude-sonnet-5',
+        maxContextTokens: 1000000,
+        temperature: 0.2,
+        topP: 0.9,
+        thinking: true,
+        thinkingDisplay: 'summarized',
+        effort: 'high',
+      },
+    };
+
+    const req = createReq(
+      {
+        endpoint: EModelEndpoint.agents,
+        spec: 'claude-sonnet-5',
+        agent_id: 'agent_abc',
+        model: 'client-model',
+        temperature: 0.8,
+      },
+      {
+        modelSpecs: {
+          enforce: true,
+          list: [modelSpec],
+        },
+      },
+    );
+    req.baseUrl = '/api/agents/chat';
+
+    await buildEndpointOption(req, createRes(), jest.fn());
+
+    const enforcedResult = parseCompactConvo.mock.results[1].value;
+    expect(enforcedResult.maxContextTokens).toBe(1000000);
+    expect(enforcedResult.temperature).toBe(0.2);
+    expect(enforcedResult.topP).toBe(0.9);
+    expect(enforcedResult.thinking).toBe(true);
+    expect(enforcedResult.thinkingDisplay).toBe('summarized');
+    expect(enforcedResult.effort).toBe('high');
+    expect(enforcedResult.model).toBeUndefined();
+  });
+});
+
+describe('buildEndpointOption - enforced server continuations', () => {
+  const {
+    createAgentTriggerExecutionHost,
+    createAgentTriggerEnvelope,
+    createSubagentThreadTurnGuard,
+    generateAgentTriggerToken,
+    isAgentTriggerRequest,
+    handleError,
+  } = require('@librechat/api');
+  const savedSpec = {
+    name: 'saved-agent',
+    label: 'Saved Agent',
+    preset: { endpoint: EModelEndpoint.agents, agent_id: 'agent-1' },
+  };
+  const config = { modelSpecs: { enforce: true, list: [savedSpec] } };
+  const conversation = {
+    user: 'user-1',
+    tenantId: 'tenant-1',
+    conversationId: 'conversation-1',
+    agent_id: 'agent-1',
+    spec: savedSpec.name,
+  };
+  let originalSecret;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockGetEndpointsConfig.mockResolvedValue({});
+    originalSecret = process.env.JWT_SECRET;
+    process.env.JWT_SECRET = 'continuation-test-signing-key';
+  });
+
+  afterEach(() => {
+    if (originalSecret === undefined) delete process.env.JWT_SECRET;
+    else process.env.JWT_SECRET = originalSecret;
+  });
+
+  it.each([
+    ['agent-queued-turn', 'agent.queued-turn'],
+    ['subagent-completion', 'subagent.completion'],
+    ['background-tool-completion', 'background-tool.completion'],
+    ['schedule', 'schedule.occurrence'],
+    ['api', 'remote.event'],
+    ['webhook', 'resource.ready'],
+    ['queue', 'message.ready'],
+  ])(
+    'admits a signed %s through the normal enforced endpoint builder',
+    async (source, eventType) => {
+      const getConvo = jest.fn(async () => conversation);
+      const guard = createSubagentThreadTurnGuard({
+        getConvo,
+        store: { isThreadActiveForOwner: () => false },
+      });
+      const scheduled = ['schedule', 'api', 'webhook', 'queue'].includes(source);
+      let admitted;
+      const host = createAgentTriggerExecutionHost({
+        getBaseUrl: () => 'http://localhost:3080',
+        mintToken: () => generateAgentTriggerToken('user-1'),
+        fetch: async (_url, init) => {
+          const req = createReq(JSON.parse(init.body), config);
+          req.baseUrl = '/api/agents/chat';
+          req.user = { id: 'user-1', tenantId: 'tenant-1' };
+          req._isAgentTrigger = isAgentTriggerRequest({
+            headers: Object.fromEntries(
+              Object.entries(init.headers).map(([key, value]) => [key.toLowerCase(), value]),
+            ),
+          });
+          expect(req._isAgentTrigger).toBe(true);
+          expect(req.body).not.toHaveProperty('spec');
+          const next = jest.fn();
+          // A cached authorization marker supplies no conversation document.
+          await guard(req, createRes(), next);
+          expect(next).toHaveBeenCalledWith();
+          next.mockClear();
+          await buildEndpointOption(req, createRes(), next);
+          expect(handleError).not.toHaveBeenCalled();
+          expect(next).toHaveBeenCalledWith();
+          admitted = req.body.endpointOption;
+          return new Response(
+            JSON.stringify({
+              status: 'started',
+              streamId: 'stream-1',
+              conversationId: 'conversation-1',
+            }),
+            { status: 200 },
+          );
+        },
+      });
+      const envelope = createAgentTriggerEnvelope({
+        mode: scheduled ? 'fire' : 'continue',
+        requestId: 'request-1',
+        deliveryId: 'delivery-1',
+        receivedAt: 1_000,
+        principal: { id: 'user-1', tenantId: 'tenant-1' },
+        target: {
+          agentId: 'agent-1',
+          ...(!scheduled && {
+            conversationId: 'conversation-1',
+            parentMessageId: 'assistant-1',
+          }),
+        },
+        event: {
+          id: 'event-1',
+          type: eventType,
+          occurredAt: 1_000,
+          source: { id: source, type: scheduled ? source : 'internal' },
+          payload: { spec: 'forged-spec' },
+        },
+        input: 'Continue the turn',
+      });
+
+      await expect(host.dispatch(envelope)).resolves.toMatchObject({ status: 'started' });
+      expect(admitted).toMatchObject({ spec: savedSpec.name, agent_id: 'agent-1' });
+      expect(getConvo).toHaveBeenCalledTimes(scheduled ? 0 : 1);
+    },
+  );
+
+  it.each([undefined, 'saved-agent', 'removed-spec'])(
+    'runs the real guard for a signed binding with persisted spec %s',
+    async (storedSpec) => {
+      const bindingId = 'evtbind_test';
+      const lineage = { parentConversationId: 'parent-1', parentAgentId: 'parent-agent' };
+      const child = {
+        user: 'user-1',
+        tenantId: 'tenant-1',
+        conversationId: 'actor-1',
+        agent_id: 'agent-1',
+        agentEventBinding: { bindingId, sourceKeyId: 'key-1', actorId: 'actor' },
+        subagentThread: lineage,
+        ...(storedSpec != null && { spec: storedSpec }),
+      };
+      const getConvo = jest.fn(async (_user, id) =>
+        id === 'parent-1'
+          ? { user: 'user-1', tenantId: 'tenant-1', conversationId: id, agent_id: 'parent-agent' }
+          : child,
+      );
+      const getEventBinding = jest.fn(async () => ({
+        conversationId: 'actor-1',
+        agentId: 'agent-1',
+        tenantId: 'tenant-1',
+        binding: child.agentEventBinding,
+        lineage,
+      }));
+      const guard = createSubagentThreadTurnGuard({
+        getConvo,
+        getEventBinding,
+        store: { isThreadActiveForOwner: () => false },
+      });
+      const host = createAgentTriggerExecutionHost({
+        getBaseUrl: () => 'http://localhost:3080',
+        mintToken: () => generateAgentTriggerToken('user-1'),
+        fetch: async (_url, init) => {
+          const req = createReq(JSON.parse(init.body), config);
+          req.baseUrl = '/api/agents/chat';
+          req.user = { id: 'user-1', tenantId: 'tenant-1' };
+          const headers = Object.fromEntries(
+            Object.entries(init.headers).map(([key, value]) => [key.toLowerCase(), value]),
+          );
+          req._isAgentTrigger = isAgentTriggerRequest({ headers });
+          req.get = (name) => headers[name.toLowerCase()];
+          const next = jest.fn();
+          await guard(req, createRes(), next);
+          expect(next).toHaveBeenCalledWith();
+          expect(req._agentEventBindingId).toBe(bindingId);
+          expect(req.resolvedConversation.user).toBe('user-1');
+          expect(req.resolvedConversation.spec).toBe(storedSpec);
+          next.mockClear();
+          await buildEndpointOption(req, createRes(), next);
+          if (storedSpec === 'removed-spec') {
+            expect(next).not.toHaveBeenCalled();
+            expect(handleError).toHaveBeenCalledWith(expect.anything(), {
+              text: 'No model spec selected',
+            });
+          } else {
+            expect(handleError).not.toHaveBeenCalled();
+            expect(next).toHaveBeenCalledWith();
+            expect(req.body.endpointOption).toMatchObject({
+              spec: savedSpec.name,
+              agent_id: 'agent-1',
+            });
+          }
+          expect(getConvo).toHaveBeenCalledTimes(2);
+          expect(getEventBinding).toHaveBeenCalledWith({
+            user: 'user-1',
+            tenantId: 'tenant-1',
+            bindingId,
+            sourceKeyId: 'key-1',
+          });
+          return new Response(
+            JSON.stringify({ status: 'started', streamId: 'actor-1', conversationId: 'actor-1' }),
+          );
+        },
+      });
+      await host.dispatch(
+        createAgentTriggerEnvelope({
+          mode: 'continue',
+          requestId: 'request-1',
+          deliveryId: 'delivery-1',
+          receivedAt: 1_000,
+          principal: { id: 'user-1', tenantId: 'tenant-1' },
+          target: {
+            agentId: 'agent-1',
+            conversationId: 'actor-1',
+            parentMessageId: 'root',
+            bindingId,
+            sourceKeyId: 'key-1',
+          },
+          event: {
+            id: 'event-1',
+            type: 'remote.event',
+            occurredAt: 1_000,
+            source: { id: 'remote', type: 'api' },
+          },
+          input: 'Handle this event',
+        }),
+      );
+    },
+  );
+
+  it('still refuses an ordinary request carrying forged continuation metadata and a trigger marker', async () => {
+    const req = createReq(
+      {
+        endpoint: EModelEndpoint.agents,
+        agent_id: 'agent-1',
+        conversationId: 'conversation-1',
+        _isAgentTrigger: true,
+        agentContinuationAdmission: { source: 'agent-queued-turn', spec: savedSpec.name },
+        agentCompletion: { version: 1, sourceId: 'subagent-completion' },
+        agentTrigger: {
+          version: 1,
+          event: {
+            type: 'schedule.occurrence',
+            occurredAt: 1_000,
+            source: { type: 'schedule', id: 'schedule-1' },
+          },
+        },
+      },
+      config,
+    );
+    req.baseUrl = '/api/agents/chat';
+    req.user = { id: 'user-1', tenantId: 'tenant-1' };
+    req.resolvedConversation = conversation;
+    req._isAgentTrigger = isAgentTriggerRequest({
+      headers: { 'x-lc-agent-trigger': '1', authorization: 'Bearer forged' },
+    });
+    const res = createRes();
+    const next = jest.fn();
+
+    await buildEndpointOption(req, res, next);
+
+    expect(handleError).toHaveBeenCalledWith(res, { text: 'No model spec selected' });
+    expect(next).not.toHaveBeenCalled();
+    expect(mockAgentBuildOptions).not.toHaveBeenCalled();
+  });
+
+  it.each(['explicit-invalid', 'wrong-endpoint'])(
+    'does not replace a supplied %s spec on a signed continuation',
+    async (selected) => {
+      const req = createReq(
+        { endpoint: EModelEndpoint.agents, agent_id: 'agent-1', spec: selected },
+        {
+          modelSpecs: {
+            enforce: true,
+            list: [
+              savedSpec,
+              { name: 'wrong-endpoint', preset: { endpoint: EModelEndpoint.openAI } },
+            ],
+          },
+        },
+      );
+      req._isAgentTrigger = true;
+      req.resolvedConversation = conversation;
+      const res = createRes();
+      const next = jest.fn();
+
+      await buildEndpointOption(req, res, next);
+
+      expect(handleError).toHaveBeenCalledWith(res, {
+        text: selected === 'explicit-invalid' ? 'Invalid model spec' : 'Model spec mismatch',
+      });
+      expect(next).not.toHaveBeenCalled();
+    },
+  );
 });

@@ -10,6 +10,7 @@ import {
   hasTurnFileConsumer,
   isNativelyReadableText,
   hasToolResourceProvisioning,
+  hasToolResourceDestination,
   canToolResourceConsume,
   resolveUploadDestination,
   getCustomEndpointProvider,
@@ -793,11 +794,20 @@ describe('hasTurnFileConsumer', () => {
     expect(hasTurnFileConsumer('video/mp4', { executeCode: false, fileSearch: true })).toBe(false);
   });
 
-  it('counts an enabled tool only where the record shows it holds the file', () => {
+  it('counts File Search only where the record shows the vector store holds the file', () => {
     const consumers = { executeCode: false, fileSearch: true };
     expect(hasTurnFileConsumer('text/csv', consumers, { embedded: true })).toBe(true);
     expect(hasTurnFileConsumer('text/csv', consumers, { embedded: false })).toBe(false);
     expect(hasTurnFileConsumer('text/csv', consumers, {})).toBe(false);
+  });
+
+  it('counts an enabled Run Code as a reader before the sandbox holds a copy', () => {
+    /* Its first call uploads the file, so no reference is needed in advance. The tool still
+     * has to be able to read the type. */
+    const consumers = { executeCode: true, fileSearch: false };
+    expect(hasTurnFileConsumer('text/csv', consumers, {})).toBe(true);
+    expect(hasTurnFileConsumer('text/csv', consumers, { metadata: {} })).toBe(true);
+    expect(hasTurnFileConsumer(eml, consumers, {})).toBe(false);
   });
 
   it('pairs the evidence with the tool that can read the type', () => {
@@ -857,6 +867,17 @@ describe('hasToolResourceProvisioning', () => {
       ),
     ).toBe(false);
     expect(hasToolResourceProvisioning({ metadata: {} }, EToolResources.execute_code)).toBe(false);
+  });
+});
+
+describe('hasToolResourceDestination', () => {
+  it('retains search eligibility without claiming vectors or another destination exist', () => {
+    const file = { embedded: false, metadata: { searchDestination: true } };
+    expect(hasToolResourceDestination(file, EToolResources.file_search)).toBe(true);
+    expect(hasToolResourceProvisioning(file, EToolResources.file_search)).toBe(false);
+    expect(hasToolResourceDestination(file, EToolResources.execute_code)).toBe(false);
+    expect(hasToolResourceDestination({}, EToolResources.file_search)).toBe(false);
+    expect(hasToolResourceDestination({ embedded: true }, EToolResources.file_search)).toBe(true);
   });
 });
 
@@ -942,6 +963,22 @@ describe('resolveTurnLLMDeliveryPath', () => {
     ).toBe('none');
   });
 
+  it('keeps the search route while confirmed vector cleanup awaits lazy repair', () => {
+    const file = {
+      ...routedCsv,
+      embedded: false,
+      metadata: { searchDestination: true },
+    };
+    expect(
+      resolveTurnLLMDeliveryPath({
+        file,
+        consumers: { executeCode: false, fileSearch: true },
+        endpointConfig,
+      }),
+    ).toBe('none');
+    expect(resolveTurnLLMDeliveryPath({ file, consumers: noReader, endpointConfig })).toBe('text');
+  });
+
   it('delivers text when File Search is on but never received the file', () => {
     /* The plain-chat File Search toggle: the upload names no destination, so nothing files it
      * under a tool resource and it is never embedded. Withholding the text on the strength of
@@ -955,16 +992,17 @@ describe('resolveTurnLLMDeliveryPath', () => {
     ).toBe('text');
   });
 
-  it('delivers text when Run Code is on but no sandbox holds the file', () => {
-    /* A promoted destination is not uploaded to the sandbox at upload time, so the turn the
-     * file arrives on carries no reference either. */
+  it('leaves a file Run Code can read with Run Code before the sandbox holds it', () => {
+    /* Delivered text counts toward the turn's attachment limits. A turn those limits refuse
+     * never runs code, so the file would never become held and every later turn would carry
+     * the same text and be refused the same way. Run Code uploads the file on its first call. */
     expect(
       resolveTurnLLMDeliveryPath({
         file: routedCsv,
         consumers: { executeCode: true, fileSearch: false },
         endpointConfig,
       }),
-    ).toBe('text');
+    ).toBe('none');
   });
 
   it('delivers text where the tool holding the file cannot read this type', () => {
@@ -1069,5 +1107,18 @@ describe('resolveTurnLLMDeliveryPath', () => {
         endpointConfig,
       }),
     ).toBe('none');
+  });
+});
+
+describe('retained code destination', () => {
+  it('preserves chosen code intent without claiming the deleted copy exists', () => {
+    const file: TurnDeliveryFile = {
+      type: 'text/plain',
+      llmDeliveryPath: 'none',
+      metadata: { destinationChosen: true, codeDestination: true },
+    };
+    expect(hasToolResourceProvisioning(file, EToolResources.execute_code)).toBe(false);
+    expect(hasToolResourceDestination(file, EToolResources.execute_code)).toBe(true);
+    expect(hasToolResourceDestination(file, EToolResources.file_search)).toBe(false);
   });
 });
